@@ -36,10 +36,28 @@ Or from a checkout, which skips the download entirely:
 git clone https://github.com/Syntaf/hop.git && cd hop && ./install.sh
 ```
 
+The installer asks where you keep your repos, guessing from the conventional
+directories (`~/Code`, `~/src`, `~/Projects`, …) by counting git repos in each:
+
+```
+hop-install: which directory holds your git repos? [~/Projects]
+```
+
+Press Enter to take the guess, or type a path (`~` works). It writes that as
+`HOP_CODE_ROOT` in your `.zshrc`. To skip the question — for a scripted or
+unattended install — set it yourself:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Syntaf/hop/main/install.sh | HOP_CODE_ROOT=~/src bash
+```
+
+With no terminal to prompt on, it uses the guess and tells you how to change it,
+rather than hanging.
+
 Then open a new shell. The installer puts `hop-resolve` in `~/.local/bin`,
-`hop.zsh` in `~/.config/hop`, and adds one `source` line to your `.zshrc`. It is
-idempotent, so re-run it to upgrade. To uninstall, delete those two files and
-that line.
+`hop.zsh` in `~/.config/hop`, and adds a short block to your `.zshrc`. It is
+idempotent — re-run it to upgrade, and it will leave an existing config alone
+rather than re-asking. To uninstall, delete those two files and that block.
 
 Requires zsh, bash 3.2+ (macOS stock is fine), git, and curl.
 
@@ -104,7 +122,7 @@ filesystem), it just creates new ones there.
 
 | variable | meaning |
 | --- | --- |
-| `HOP_CODE_ROOT` | where to scan for repos (default `~/Code`) |
+| `HOP_CODE_ROOT` | where to scan for repos; set by the installer (default `~/Code`) |
 | `HOP_CACHE_TTL` | seconds to cache the scan (default `0` = always fresh) |
 | `HOP_BANNER` | `0`, `off` or `no` to skip the arrival block |
 | `NO_COLOR` | honoured; colour is also dropped when piped |
