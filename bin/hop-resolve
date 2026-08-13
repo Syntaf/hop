@@ -1,0 +1,719 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+CODE_ROOT="${HOP_CODE_ROOT:-$HOME/Code}"
+CACHE_TTL="${HOP_CACHE_TTL:-0}"
+# Tab is an IFS whitespace char, so `read` would collapse the empty branch
+# field of a detached worktree and shift every column left.
+SEP=$'\x1f'
+TILDE='~'
+CACHE_FILE="${TMPDIR:-/tmp}/hop-resolve-cache.${UID:-0}.${CODE_ROOT//\//%}"
+CUR_REPO=""
+case "$PWD" in
+"$CODE_ROOT"/*)
+	CUR_REPO=${PWD#"$CODE_ROOT"/}
+	CUR_REPO=${CUR_REPO%%/*}
+	;;
+esac
+
+die() {
+	printf 'hop: %s\n' "$*" >&2
+	exit 2
+}
+
+find_repos() {
+	local d sub
+	shopt -s nullglob
+	for d in "$CODE_ROOT"/*/; do
+		if [ -e "$d.git" ]; then
+			printf '%s\n' "${d%/}"
+			continue
+		fi
+		for sub in "$d"*/; do
+			[ -e "$sub.git" ] && printf '%s\n' "${sub%/}"
+		done
+	done
+	shopt -u nullglob
+}
+
+# git worktree list always emits the main worktree first; every worktree in a
+# family inherits its repo label from that first record.
+parse_porcelain() {
+	awk -v OFS="$SEP" '
+		BEGIN { repo=""; p=""; b=""; lock=""; bare=0 }
+		function base(s) { n = split(s, a, "/"); return a[n] }
+		function flush() {
+			if (p == "") return
+			if (repo == "") repo = base(p)
+			if (!bare) print repo, b, base(p), p, lock
+			p = ""; b = ""; lock = ""; bare = 0
+		}
+		FNR == 1      { flush(); repo = "" }
+		/^worktree /  { flush(); p = substr($0, 10); next }
+		/^branch /    { b = substr($0, 8); sub(/^refs\/heads\//, "", b); next }
+		/^locked/     { lock = "locked"; next }
+		/^bare$/      { bare = 1; next }
+		END { flush() }
+	' "$@"
+}
+
+collect_fresh() {
+	local tmp repo_dir i=0
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/hop-scan.XXXXXX") || die "cannot create temp dir"
+	while IFS= read -r repo_dir; do
+		[ -n "$repo_dir" ] || continue
+		i=$((i + 1))
+		git -C "$repo_dir" worktree list --porcelain >"$tmp/$i" 2>/dev/null &
+	done < <(find_repos)
+	wait
+	if [ "$i" -gt 0 ]; then
+		parse_porcelain "$tmp"/* |
+			sort -t"$SEP" -k4,4 -u | sort -t"$SEP" -k1,1 -k4,4
+	fi
+	rm -rf "$tmp"
+}
+
+collect() {
+	if [ "$CACHE_TTL" -le 0 ]; then
+		collect_fresh
+		return
+	fi
+	if [ -s "$CACHE_FILE" ]; then
+		local now mtime
+		now=$(date +%s)
+		mtime=$(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)
+		if [ $((now - mtime)) -lt "$CACHE_TTL" ]; then
+			cat "$CACHE_FILE"
+			return
+		fi
+	fi
+	collect_fresh | tee "$CACHE_FILE"
+}
+
+rank() {
+	awk -v q="$1" -v cur="$2" -v FS="$SEP" -v OFS="$SEP" '
+		BEGIN {
+			lq = tolower(q)
+			ntok = split(lq, T, /[ \t]+/)
+		}
+		{
+			repo = $1; branch = $2; dir = $3; path = $4; flags = $5
+			lb = tolower(branch); ld = tolower(dir)
+			leaf = branch; sub(/^.*\//, "", leaf)
+
+			tier = 0
+			if (branch != "" && lb == lq)             tier = 1
+			else if (branch != "" && tolower(leaf) == lq) tier = 2
+			else if (ld == lq)                        tier = 3
+			else if (branch != "" && index(lb, lq))   tier = 4
+			else if (index(ld, lq))                   tier = 5
+			else if (ntok > 0) {
+				hay = tolower(repo " " branch " " dir)
+				all = 1
+				for (i = 1; i <= ntok; i++)
+					if (index(hay, T[i]) == 0) { all = 0; break }
+				if (all) tier = 6
+			}
+			if (tier)
+				print tier, (repo == cur ? 0 : 1), repo, branch, dir, path, flags
+		}
+	' | sort -t"$SEP" -k1,1n -k2,2n -k3,3 -k4,4
+}
+
+print_rows() {
+	local numbered=$1 cols repo_w=0 branch_w n=0 i
+	local repo branch dir path flags where mark rest
+	local -a r_repo r_branch r_where r_mark
+
+	while IFS="$SEP" read -r repo branch dir path flags; do
+		[ -n "$path" ] || continue
+		n=$((n + 1))
+		case "$path" in
+		"$CODE_ROOT/$repo")
+			where=root
+			;;
+		"$CODE_ROOT/$repo/.claude/worktrees/"*)
+			where="wt:$dir"
+			;;
+		"$HOME/.metal/worktrees/"*)
+			rest=${path#"$HOME"/.metal/worktrees/}
+			where="metal:${rest%%/*}"
+			;;
+		*)
+			where="${path/#$HOME/$TILDE}"
+			;;
+		esac
+		[ -n "$branch" ] || branch="(detached)"
+		mark=""
+		[ -d "$path" ] || mark=" [missing]"
+		[ -n "${flags:-}" ] && mark="$mark [$flags]"
+		r_repo[n]=$repo
+		r_branch[n]=$branch
+		r_where[n]=$where
+		r_mark[n]=$mark
+		[ "${#repo}" -gt "$repo_w" ] && repo_w=${#repo}
+	done
+	[ "$n" -eq 0 ] && return 0
+
+	case "${COLUMNS:-}" in
+	'' | *[!0-9]*) cols=100 ;;
+	*) [ "$COLUMNS" -gt 60 ] && cols=$COLUMNS || cols=100 ;;
+	esac
+	branch_w=$((cols - repo_w - 26))
+	[ "$numbered" = yes ] && branch_w=$((branch_w - 5))
+	[ "$branch_w" -lt 18 ] && branch_w=18
+	[ "$branch_w" -gt 58 ] && branch_w=58
+
+	i=1
+	while [ "$i" -le "$n" ]; do
+		branch=${r_branch[$i]}
+		if [ "${#branch}" -gt "$branch_w" ]; then
+			branch="${branch:0:$((branch_w - 2))}.."
+		fi
+		if [ "$numbered" = yes ]; then
+			printf '  %2d) %-*s  %-*s  %s%s\n' \
+				"$i" "$repo_w" "${r_repo[$i]}" "$branch_w" "$branch" "${r_where[$i]}" "${r_mark[$i]}"
+		else
+			printf '  %-*s  %-*s  %s%s\n' \
+				"$repo_w" "${r_repo[$i]}" "$branch_w" "$branch" "${r_where[$i]}" "${r_mark[$i]}"
+		fi
+		i=$((i + 1))
+	done
+}
+
+no_match() {
+	printf 'hop: nothing under %s matches %s\n' "${CODE_ROOT/#$HOME/$TILDE}" "'$1'" >&2
+	printf "     run 'hop' to list every worktree, or retry with a shorter fragment\n" >&2
+}
+
+# Branches with no worktree, as candidates for creating one. Emitted in the same
+# shape as collect() so rank() can score both with identical rules.
+collect_refs() {
+	local tmp repo_dir i=0
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/hop-refs.XXXXXX") || die "cannot create temp dir"
+	while IFS= read -r repo_dir; do
+		[ -n "$repo_dir" ] || continue
+		i=$((i + 1))
+		{
+			printf 'hoprepo %s\n' "${repo_dir##*/}"
+			git -C "$repo_dir" for-each-ref --format='%(refname)' refs/heads refs/remotes 2>/dev/null
+		} >"$tmp/$i" &
+	done < <(find_repos)
+	wait
+	if [ "$i" -gt 0 ]; then
+		awk -v OFS="$SEP" '
+			/^hoprepo / { repo = substr($0, index($0, " ") + 1); next }
+			/^refs\/heads\// {
+				br = substr($0, 12)
+				if (br == "") next
+				k = repo SUBSEP br
+				if (!(k in src)) order[++nn] = k
+				src[k] = "local"
+				next
+			}
+			/^refs\/remotes\// {
+				rest = substr($0, 14)
+				s = index(rest, "/")
+				if (s == 0) next
+				rem = substr(rest, 1, s - 1)
+				br = substr(rest, s + 1)
+				if (br == "" || br == "HEAD") next
+				k = repo SUBSEP br
+				if (!(k in src)) { order[++nn] = k; src[k] = rem }
+				next
+			}
+			END {
+				for (i = 1; i <= nn; i++) {
+					k = order[i]
+					if (k in src) {
+						split(k, part, SUBSEP)
+						print part[1], part[2], "", "", src[k]
+						delete src[k]
+					}
+				}
+			}
+		' "$tmp"/*
+	fi
+	rm -rf "$tmp"
+}
+
+match_refs() {
+	collect_refs | rank "$1" "$CUR_REPO" |
+		awk -F"$SEP" -v OFS="$SEP" 'NR == 1 { t = $1 } $1 == t { print $3, $4, $7 }'
+}
+
+resolve_repo_dir() {
+	local want=$1 d hit="" n=0
+	while IFS= read -r d; do
+		if [ "${d##*/}" = "$want" ]; then
+			hit=$d
+			n=$((n + 1))
+		fi
+	done < <(find_repos)
+	[ "$n" -eq 1 ] || return 1
+	printf '%s' "$hit"
+}
+
+default_remote() {
+	local repo_dir=$1 remotes r
+	remotes=$(git -C "$repo_dir" remote 2>/dev/null)
+	[ -n "$remotes" ] || return 1
+	while IFS= read -r r; do
+		if [ "$r" = origin ]; then
+			printf 'origin'
+			return 0
+		fi
+	done <<<"$remotes"
+	printf '%s' "${remotes%%$'\n'*}"
+}
+
+confirm() {
+	local reply
+	printf '%s [y/N] ' "$1" >&2
+	IFS= read -r reply </dev/tty || {
+		printf '\n' >&2
+		return 1
+	}
+	case "$reply" in
+	y | Y | yes | Yes | YES) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+print_ref_rows() {
+	local n=0 repo branch source label
+	while IFS="$SEP" read -r repo branch source; do
+		[ -n "$branch" ] || continue
+		n=$((n + 1))
+		if [ "$source" = local ]; then
+			label='local branch, no worktree'
+		else
+			label="on $source, not checked out"
+		fi
+		printf '  %2d) %-20s %-44s %s\n' "$n" "$repo" "$branch" "$label"
+	done
+}
+
+create_worktree() {
+	local repo=$1 branch=$2 source=$3
+	local repo_dir wt_dir
+	repo_dir=$(resolve_repo_dir "$repo") ||
+		die "more than one repo under ${CODE_ROOT/#$HOME/$TILDE} is named '$repo' — cd into the one you mean"
+	wt_dir="$repo_dir/.claude/worktrees/${branch//\//+}"
+
+	[ -e "$wt_dir" ] && die "${wt_dir/#$HOME/$TILDE} already exists — remove it or name another branch"
+
+	if [ ! -t 2 ] || [ ! -r /dev/tty ]; then
+		printf 'hop: no worktree holds %s, but it exists in %s (%s). Create it with:\n' \
+			"$branch" "$repo" "$source" >&2
+		if [ "$source" = local ]; then
+			printf '     git -C %s worktree add %s %s\n' "$repo_dir" "$wt_dir" "$branch" >&2
+		else
+			printf '     git -C %s fetch %s %s\n' "$repo_dir" "$source" "$branch" >&2
+			printf '     git -C %s worktree add --track -b %s %s %s/%s\n' \
+				"$repo_dir" "$branch" "$wt_dir" "$source" "$branch" >&2
+		fi
+		return 5
+	fi
+
+	if [ "$source" = local ]; then
+		printf 'hop: no worktree holds %s — it is a local branch in %s.\n' "$branch" "$repo" >&2
+		confirm "     create a worktree at ${wt_dir/#$HOME/$TILDE}?" || return 130
+		git -C "$repo_dir" worktree add "$wt_dir" "$branch" >&2 ||
+			die "git worktree add failed in $repo"
+	else
+		printf 'hop: no worktree holds %s — it is on %s in %s.\n' "$branch" "$source" "$repo" >&2
+		confirm "     fetch it and create a worktree at ${wt_dir/#$HOME/$TILDE}?" || return 130
+		git -C "$repo_dir" fetch "$source" "$branch" >&2 ||
+			die "git fetch $source $branch failed in $repo"
+		git -C "$repo_dir" worktree add --track -b "$branch" "$wt_dir" "$source/$branch" >&2 ||
+			die "git worktree add failed in $repo"
+	fi
+	printf '%s\n' "$wt_dir"
+}
+
+offer_fetch() {
+	local query=$1 repo="" repo_dir remote tok
+	local -a toks
+	if [ -n "$CUR_REPO" ] && resolve_repo_dir "$CUR_REPO" >/dev/null 2>&1; then
+		repo=$CUR_REPO
+	else
+		read -r -a toks <<<"$query"
+		for tok in "${toks[@]}"; do
+			if resolve_repo_dir "$tok" >/dev/null 2>&1; then
+				repo=$tok
+				break
+			fi
+		done
+	fi
+
+	if [ -z "$repo" ]; then
+		printf 'hop: no worktree and no branch under %s matches %s\n' \
+			"${CODE_ROOT/#$HOME/$TILDE}" "'$query'" >&2
+		printf '     if it is brand new on the remote, name the repo so I know where to fetch:\n' >&2
+		printf '       hop <repo> %s\n' "$query" >&2
+		return 1
+	fi
+
+	repo_dir=$(resolve_repo_dir "$repo") || die "more than one repo is named '$repo'"
+	printf 'hop: no worktree and no known branch matches %s.\n' "'$query'" >&2
+
+	if ! remote=$(default_remote "$repo_dir"); then
+		printf '     %s has no remote, so there is nothing to fetch\n' "$repo" >&2
+		return 1
+	fi
+
+	if [ ! -t 2 ] || [ ! -r /dev/tty ]; then
+		printf '     it may be new on %s; try: git -C %s fetch --prune %s\n' \
+			"$remote" "$repo_dir" "$remote" >&2
+		return 1
+	fi
+
+	confirm "     fetch $remote in $repo and look again?" || return 130
+	git -C "$repo_dir" fetch --prune "$remote" >&2 || die "git fetch failed in $repo"
+}
+
+offer_create() {
+	local query=$1 refs
+	refs=$(match_refs "$query")
+
+	if [ -z "$refs" ]; then
+		offer_fetch "$query" || return $?
+		refs=$(match_refs "$query")
+		if [ -z "$refs" ]; then
+			printf 'hop: still nothing matching %s after fetching\n' "'$query'" >&2
+			return 1
+		fi
+	fi
+
+	local -a rows
+	local line n=0 repo branch source
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		rows[n]=$line
+		n=$((n + 1))
+	done <<<"$refs"
+
+	if [ "$n" -eq 1 ]; then
+		IFS="$SEP" read -r repo branch source <<<"${rows[0]}"
+		create_worktree "$repo" "$branch" "$source"
+		return $?
+	fi
+
+	if [ ! -t 2 ] || [ ! -r /dev/tty ]; then
+		printf 'hop: no worktree holds %s, and %s branches match — be more specific\n' "'$query'" "$n" >&2
+		printf '%s\n' "$refs" | print_ref_rows >&2
+		return 3
+	fi
+
+	printf 'hop: no worktree holds %s, but %s branches match:\n' "'$query'" "$n" >&2
+	printf '%s\n' "$refs" | print_ref_rows >&2
+	printf 'create a worktree for [1-%s, q to cancel]: ' "$n" >&2
+
+	local reply
+	IFS= read -r reply </dev/tty || {
+		printf '\n' >&2
+		return 130
+	}
+	case "$reply" in
+	q | Q | '') return 130 ;;
+	*[!0-9]*) die "not a selection: '$reply'" ;;
+	esac
+	if [ "$reply" -lt 1 ] || [ "$reply" -gt "$n" ]; then
+		die "selection out of range: $reply (have 1-$n)"
+	fi
+
+	IFS="$SEP" read -r repo branch source <<<"${rows[$((reply - 1))]}"
+	create_worktree "$repo" "$branch" "$source"
+}
+
+cmd_list() {
+	local query="$*" rows
+	if [ -n "$query" ]; then
+		rows=$(collect | rank "$query" "$CUR_REPO" | cut -d"$SEP" -f3-)
+		if [ -z "$rows" ] && [ "$CACHE_TTL" -gt 0 ]; then
+			CACHE_TTL=0
+			rows=$(collect | rank "$query" "$CUR_REPO" | cut -d"$SEP" -f3-)
+		fi
+		if [ -z "$rows" ]; then
+			no_match "$query"
+			return 1
+		fi
+	else
+		rows=$(collect)
+		[ -n "$rows" ] || die "no git repositories found under ${CODE_ROOT/#$HOME/$TILDE}"
+	fi
+	printf '%s\n' "$rows" | print_rows no
+}
+
+cmd_branches() {
+	collect | awk -F"$SEP" '{ if ($2 != "") print $2; print $3 }' | sort -u
+}
+
+cmd_path() {
+	local query="$*"
+	[ -n "$query" ] || die "usage: hop <branch-or-worktree-name>"
+
+	local ranked matches count
+	ranked=$(collect | rank "$query" "$CUR_REPO")
+	# A cache miss may just mean the worktree was created after the last scan.
+	if [ -z "$ranked" ] && [ "$CACHE_TTL" -gt 0 ]; then
+		CACHE_TTL=0
+		ranked=$(collect | rank "$query" "$CUR_REPO")
+	fi
+	if [ -z "$ranked" ]; then
+		offer_create "$query"
+		return $?
+	fi
+
+	matches=$(printf '%s\n' "$ranked" |
+		awk -F"$SEP" -v OFS="$SEP" 'NR == 1 { t = $1 } $1 == t { print $3, $4, $5, $6, $7 }')
+
+	local -a rows
+	local line n=0
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		rows[n]=$line
+		n=$((n + 1))
+	done <<<"$matches"
+	count=$n
+
+	if [ "$count" -eq 1 ]; then
+		local repo branch dir path flags
+		IFS="$SEP" read -r repo branch dir path flags <<<"${rows[0]}"
+		if [ ! -d "$path" ]; then
+			printf 'hop: %s is registered at %s but that directory is gone\n' \
+				"${branch:-$dir}" "${path/#$HOME/$TILDE}" >&2
+			printf '     run: git -C %s worktree prune\n' "$CODE_ROOT/$repo" >&2
+			return 4
+		fi
+		printf '%s\n' "$path"
+		return 0
+	fi
+
+	if [ ! -t 2 ] || [ ! -r /dev/tty ]; then
+		printf 'hop: %s matches %s worktrees — be more specific\n' "'$query'" "$count" >&2
+		printf '%s\n' "$matches" | print_rows no >&2
+		return 3
+	fi
+
+	printf "'%s' matches %s worktrees:\n" "$query" "$count" >&2
+	printf '%s\n' "$matches" | print_rows yes >&2
+	printf 'select [1-%s, q to cancel]: ' "$count" >&2
+
+	local reply
+	IFS= read -r reply </dev/tty || {
+		printf '\n' >&2
+		return 130
+	}
+	case "$reply" in
+	q | Q | '') return 130 ;;
+	*[!0-9]*) die "not a selection: '$reply'" ;;
+	esac
+	if [ "$reply" -lt 1 ] || [ "$reply" -gt "$count" ]; then
+		die "selection out of range: $reply (have 1-$count)"
+	fi
+
+	local repo branch dir chosen flags
+	IFS="$SEP" read -r repo branch dir chosen flags <<<"${rows[$((reply - 1))]}"
+	[ -d "$chosen" ] || die "$chosen no longer exists — run git worktree prune"
+	printf '%s\n' "$chosen"
+}
+
+cmd_describe() {
+	local path=$1 prev=${2:-}
+	[ -n "$path" ] && [ -d "$path" ] || return 0
+
+	local c_off='' c_repo='' c_branch='' c_lab='' c_dim='' c_ahead='' c_behind='' c_mod='' c_det=''
+	if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+		c_off=$'\033[0m'
+		c_repo=$'\033[1;36m'
+		c_branch=$'\033[1;33m'
+		c_lab=$'\033[2;37m'
+		c_dim=$'\033[2m'
+		c_ahead=$'\033[32m'
+		c_behind=$'\033[31m'
+		c_mod=$'\033[35m'
+		c_det=$'\033[1;31m'
+	fi
+
+	local repo='' spot='' repo_dir='' rest first second
+	case "$path" in
+	"$HOME"/.metal/worktrees/*)
+		rest=${path#"$HOME"/.metal/worktrees/}
+		spot="metal instance ${rest%%/*}"
+		repo=${rest#*/}
+		repo=${repo%%/*}
+		;;
+	"$CODE_ROOT"/*)
+		rest=${path#"$CODE_ROOT"/}
+		first=${rest%%/*}
+		if [ -e "$CODE_ROOT/$first/.git" ]; then
+			repo_dir="$CODE_ROOT/$first"
+		else
+			second=${rest#"$first"/}
+			second=${second%%/*}
+			if [ -n "$second" ] && [ -e "$CODE_ROOT/$first/$second/.git" ]; then
+				repo_dir="$CODE_ROOT/$first/$second"
+			fi
+		fi
+		if [ -n "$repo_dir" ]; then
+			repo=${repo_dir##*/}
+			rest=${path#"$repo_dir"}
+			case "$rest" in
+			'') spot='main checkout' ;;
+			esac
+		else
+			repo=$first
+		fi
+		;;
+	*)
+		repo=${path##*/}
+		;;
+	esac
+
+	local status_out branch='' oid='' upstream='' ahead=0 behind=0 modified=0 line
+	status_out=$(git -C "$path" status --porcelain=v2 --branch -uno 2>/dev/null)
+	while IFS= read -r line; do
+		case "$line" in
+		'# branch.head '*) branch=${line#\# branch.head } ;;
+		'# branch.oid '*) oid=${line#\# branch.oid } ;;
+		'# branch.upstream '*) upstream=${line#\# branch.upstream } ;;
+		'# branch.ab '*)
+			rest=${line#\# branch.ab +}
+			ahead=${rest%% *}
+			behind=${rest##*-}
+			;;
+		[12u]' '*) modified=$((modified + 1)) ;;
+		esac
+	done <<<"$status_out"
+
+	local w=6
+	row() {
+		printf '  %s%-*s%s  %s\n' "$c_lab" "$w" "$1" "$c_off" "$2"
+	}
+
+	if [ -n "$prev" ] && { [ "$prev" = "$path" ] || [ "$prev" -ef "$path" ] 2>/dev/null; }; then
+		printf '  %salready here%s\n' "$c_dim" "$c_off"
+	fi
+
+	row repo "$c_repo$repo$c_off"
+
+	if [ "$branch" = '(detached)' ]; then
+		row branch "${c_det}detached${c_off}${c_dim} at ${oid:0:9}${c_off}"
+	elif [ -n "$branch" ]; then
+		row branch "$c_branch$branch$c_off"
+	fi
+
+	local up_label=$upstream
+	[ -n "$upstream" ] && [ "$upstream" = "${upstream%%/*}/$branch" ] && up_label=${upstream%%/*}
+
+	local st='' diverged=0
+	if [ "$ahead" -gt 0 ] 2>/dev/null; then
+		st="$st, ${c_ahead}${ahead} ahead${c_off}"
+		diverged=1
+	fi
+	if [ "$behind" -gt 0 ] 2>/dev/null; then
+		st="$st, ${c_behind}${behind} behind${c_off}"
+		diverged=1
+	fi
+	[ "$modified" -gt 0 ] && st="$st, ${c_mod}${modified} modified${c_off}"
+	if [ -n "$st" ]; then
+		st=${st#, }
+		[ "$diverged" -eq 1 ] && [ -n "$upstream" ] && st="$st ${c_dim}vs ${up_label}${c_off}"
+	elif [ -n "$upstream" ]; then
+		st="${c_dim}in sync with ${up_label}, no tracked changes${c_off}"
+	elif [ -n "$branch" ]; then
+		st="${c_dim}no tracked changes${c_off}"
+	fi
+	[ -n "$st" ] && row status "$st"
+
+	local shown=${path/#$HOME/$TILDE}
+	[ -n "$spot" ] && shown="$shown ($spot)"
+	row path "$c_dim$shown$c_off"
+}
+
+cmd_help() {
+	cat <<'EOF'
+hop — jump to the git worktree holding a branch
+
+  hop <query>       cd into the matching worktree (prompts when ambiguous)
+  hop               list every worktree found under ~/Code
+  hop -l <query>    list matches without cd'ing
+  hop -p <query>    print the path only:  code "$(hop -p my-branch)"
+  hop -r            rebuild the cache now (only useful with HOP_CACHE_TTL set)
+  hop -h            this help
+
+You never name a repo — every repo under ~/Code is searched at once. A repo name
+is just an optional extra word to disambiguate: hop webapp login-fix.
+
+Matching — the best tier wins, ties prompt:
+  1  exact branch              claude/fix-thing
+  2  exact branch leaf         fix-thing
+  3  exact worktree dir        pr-4821-review
+  4  branch substring          fix-th
+  5  worktree dir substring    4821
+  6  every word appears        webapp alice session
+
+Worktrees in the repo you are standing in sort first. Registered-but-deleted
+worktrees are flagged rather than silently skipped.
+
+When no worktree holds the branch, hop looks for the branch itself — locally and
+on every remote it has already fetched — and offers to create a worktree at
+<repo>/.claude/worktrees/<branch with / as +>, fetching the branch first when it
+only exists on a remote. Nothing is created without a y/N confirmation, and a
+non-interactive caller gets the git commands printed instead. If the branch is
+so new that no remote-tracking ref exists yet, hop offers to fetch the repo you
+are standing in, or name it: hop <repo> <branch>.
+
+On arrival hop labels where you landed:
+
+  repo    webapp
+  branch  claude/rework-auth
+  status  1 behind vs origin
+  path    ~/Code/webapp (main checkout)
+
+status is any of N ahead / N behind / N modified, or "in sync with <remote>, no
+tracked changes". Untracked files are deliberately not counted — scanning for
+them costs ~2s in a large monorepo — so "modified" and "no tracked
+changes" both refer to tracked files only. The path row is annotated with
+"(main checkout)" or "(metal instance X)"; a plain path under .claude/worktrees
+is a worktree. An "already here" line appears when you were in that worktree
+already.
+
+Environment:
+  HOP_CODE_ROOT   where to scan for repos (default ~/Code)
+  HOP_CACHE_TTL   seconds to cache the scan (default 0 = always fresh)
+  HOP_BANNER      0, off or no to skip the arrival banner
+  NO_COLOR        honoured; colour is also dropped when output is not a terminal
+EOF
+}
+
+case "${1:-list}" in
+list)
+	shift 2>/dev/null || true
+	cmd_list "$@"
+	;;
+path)
+	shift
+	cmd_path "$@"
+	;;
+branches)
+	cmd_branches
+	;;
+describe)
+	shift
+	cmd_describe "${1:-}" "${2:-}"
+	;;
+refresh)
+	rm -f "$CACHE_FILE"
+	collect_fresh >"$CACHE_FILE"
+	printf 'hop: cached %s worktrees\n' "$(grep -c '' "$CACHE_FILE")" >&2
+	;;
+help | -h | --help)
+	cmd_help
+	;;
+*)
+	die "unknown subcommand: $1"
+	;;
+esac
