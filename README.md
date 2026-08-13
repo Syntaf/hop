@@ -68,6 +68,11 @@ Pin a version with `HOP_REF`, and change where things land with `HOP_BIN_DIR` /
 curl -fsSL https://raw.githubusercontent.com/Syntaf/hop/main/install.sh | HOP_REF=v0.1.0 bash
 ```
 
+`HOP_REF` is what pins the version — fetching `install.sh` from a tag URL alone
+does not, since the script then fetches its payload from `main`. Note also that
+`raw.githubusercontent.com` caches for a few minutes, so an install run
+immediately after a push may get the previous commit.
+
 ## Usage
 
 ```
