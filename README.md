@@ -1,11 +1,32 @@
 # hop
 
+```
+         _       _    _            _      
+        / /\    / /\ /\ \         /\ \    
+       / / /   / / //  \ \       /  \ \   
+      / /_/   / / // /\ \ \     / /\ \ \  
+     / /\ \__/ / // / /\ \ \   / / /\ \_\ 
+    / /\ \___\/ // / /  \ \_\ / / /_/ / / 
+   / / /\/___/ // / /   / / // / /__\/ /  
+  / / /   / / // / /   / / // / /_____/   
+ / / /   / / // / /___/ / // / /          
+/ / /   / / // / /____\/ // / /           
+\/_/    \/_/ \/_________/ \/_/            
+                                          
+```
+
 Jump to the git worktree holding a branch.
 
-If you keep a lot of worktrees, finding the one holding a given branch means
-running `git worktree list` in repo after repo — and the worktree's directory
-name usually isn't the branch name. `hop` searches every repo you have at once
-and `cd`s you there.
+![hop demo](docs/demo.gif)
+
+If you use a lot of worktrees, especially with agents, you might not always
+know where a branch is checked out locally.
+
+Sure you can use `git worktree list`, but it's still tedious to list, cross
+reference, then cd into the worktree.
+
+`hop` is just a simple CLI tool that searches your repositories to find a
+given branch and `cd` into that worktree for you.
 
 ```
 $ hop login-fix
@@ -134,29 +155,3 @@ filesystem), it just creates new ones there.
 
 Repos are found by looking for `.git` one and two levels below
 `HOP_CODE_ROOT` — so `~/Code/myrepo` and `~/Code/scratch/myrepo` both work.
-
-## Notes on behaviour
-
-A few decisions worth knowing, since they're deliberate:
-
-- **Ambiguity always prompts.** Two repos with the same branch name give you a
-  numbered picker. Non-interactive callers get the candidate list and a non-zero
-  exit instead of a silently-chosen first match.
-- **Untracked files are not counted.** `status` reports tracked changes only,
-  because scanning for untracked files costs ~2s in a large monorepo versus
-  ~0.1s without. That's why it says "no tracked changes" rather than "clean".
-- **Registered-but-deleted worktrees are flagged,** not skipped, with the
-  `git worktree prune` command to fix them.
-- **The scan is fresh by default.** It's one parallel `git worktree list` per
-  repo, ~0.15s across 30 repos. Set `HOP_CACHE_TTL` if you want it cached; a
-  cache miss re-scans before reporting failure, so a just-created worktree is
-  never invisible.
-
-## Why a shell function
-
-A process can't change its parent shell's directory, so `hop` is a zsh function
-wrapping `hop-resolve`. The resolver prints a path on stdout and everything else
-on stderr, which is what makes `hop -p` composable.
-
-Bash users: `hop-resolve` itself is bash and works fine, but the `hop` function
-is zsh-only. A bash wrapper would be a short addition — it isn't written yet.
